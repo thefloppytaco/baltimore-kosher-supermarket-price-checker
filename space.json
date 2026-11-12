@@ -1,0 +1,24 @@
+{
+  "entry": "client/dist/index.html",
+  "managedCronJobs": [
+    {
+      "action": "synccatalog",
+      "id": "space-__SPACE_SLUG__-catalog-sync",
+      "schedule": "daily 06:30 America/New_York"
+    },
+    {
+      "action": "refreshall",
+      "id": "space-__SPACE_SLUG__-daily-refresh",
+      "schedule": "daily 07:15 America/New_York"
+    },
+    {
+      "action": "kicksevensweep",
+      "id": "space-__SPACE_SLUG__-seven-watchdog",
+      "schedule": "hourly"
+    }
+  ],
+  "name": "Market Maven vs Seven Mile Price Compare",
+  "platformVersion": 28,
+  "runtime": "typescript",
+  "slug": "__SPACE_SLUG__"
+}

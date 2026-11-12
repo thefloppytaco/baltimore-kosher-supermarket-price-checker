@@ -1,0 +1,104 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1794415160716,
+      "tag": "0001_initial",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1794415160716,
+      "tag": "0002_watchlist_and_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794415943169,
+      "tag": "0003_add_product_catalog",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1794427155992,
+      "tag": "0004_section_attempts_and_errors",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794433569717,
+      "tag": "0005_add_barcode_mappings",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794434569151,
+      "tag": "0006_seven_mile_category_sweep_and_expected_counts",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794503712386,
+      "tag": "0007_spot_checks_and_first_seen",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794507724608,
+      "tag": "0008_brand_preferences",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1794509458343,
+      "tag": "0009_section_labels_for_categories",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1794510645331,
+      "tag": "0010_add_cart_items",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1794518819288,
+      "tag": "0011_multi_buy_deal_pricing",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1794521198915,
+      "tag": "0012_cart_price_basis_per_pound",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1794522219603,
+      "tag": "0013_add_catalog_size_text",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1794524123139,
+      "tag": "0014_add_price_history",
+      "breakpoints": true
+    }
+  ]
+}
