@@ -8,6 +8,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   aisleForCategory,
+  extractFrontendData,
+  jsonPageProblem,
   listLineCost,
   pairMatchTwo,
   pairProducts,
@@ -16,6 +18,9 @@ import {
   pickBest,
   priceBasisOf,
   scoreMatch,
+  storAiCategoryIdFromTerm,
+  storAiCategoryProductsUrl,
+  storAiLeafCategories,
   verdictFor,
   withUnit,
   type Product,
@@ -263,5 +268,154 @@ describe("listLineCost", () => {
     const rice = mk("Rice", 3); // no parseable size
     expect(listLineCost(rice, "2 lb")).toBeNull();
     expect(listLineCost(null, "2 lb")).toBeNull();
+  });
+});
+
+// ---------- the store's own catalog tree (data.js) ----------
+// The blob is JavaScript, not JSON, and it is where the whole sweep
+// queue comes from — so the parser is pinned against the shapes that
+// would quietly truncate the tree: braces and quotes inside names, a
+// department hidden at the parent while its children still say
+// visible, and a category repeated under two parents.
+
+const BRANCH = 967;
+const DATA_JS = `window.sp = window.sp || {};
+window.sp.frontendData = {"retailer":{"id":1138,"names":{"2":"Seven Mile Market"}},"tree":{"categories":[
+  {"id":10,"names":{"2":"Dairy & Eggs"},"isVisible":true,
+   "branches":{"967":{"isVisible":true,"hasVisibleProducts":true}},
+   "subCategories":[
+     {"id":11,"names":{"2":"Milk & Cream"},"isVisible":true,
+      "branches":{"967":{"isVisible":true,"hasVisibleProducts":true}},
+      "subCategories":[
+        {"id":78154,"names":{"2":"Milk  "},"isVisible":true,"families":[{"id":5}],
+         "branches":{"967":{"isVisible":true,"hasVisibleProducts":true,"aisleName":"Milk and Orange Juice"}},
+         "subCategories":[]}
+      ]},
+     {"id":12,"names":{"2":"Butter {and} \\"Spreads\\""},"isVisible":true,
+      "branches":{"967":{"isVisible":true,"hasVisibleProducts":false}},
+      "subCategories":[]}
+   ]},
+  {"id":20,"names":{"2":"Passover"},"isVisible":false,
+   "branches":{"967":{"isVisible":true,"hasVisibleProducts":true}},
+   "subCategories":[
+     {"id":21,"names":{"2":"Matzah"},"isVisible":true,
+      "branches":{"967":{"isVisible":true,"hasVisibleProducts":true}},
+      "subCategories":[]},
+     {"id":78154,"names":{"2":"Milk"},"isVisible":true,
+      "branches":{"967":{"isVisible":true,"hasVisibleProducts":true}},
+      "subCategories":[]}
+   ]}
+]}};
+window.sp.other = {"unrelated":true};
+`;
+
+describe("extractFrontendData", () => {
+  test("brace-matches the object out of the JavaScript blob", () => {
+    const data = extractFrontendData(DATA_JS) as {
+      retailer: { id: number };
+      tree: { categories: unknown[] };
+    };
+    expect(data.retailer.id).toBe(1138);
+    expect(data.tree.categories).toHaveLength(2);
+  });
+  test("a blob without the object is an error, never a partial tree", () => {
+    expect(() => extractFrontendData("window.sp = {};")).toThrow();
+    expect(() => extractFrontendData('frontendData = {"tree":{')).toThrow();
+  });
+});
+
+describe("storAiLeafCategories", () => {
+  const leaves = storAiLeafCategories(extractFrontendData(DATA_JS), BRANCH);
+  test("only leaves, with breadcrumb, department and aisle", () => {
+    const milk = leaves.find((l) => l.id === 78154);
+    expect(milk).toBeDefined();
+    expect(milk!.name).toBe("Milk");
+    expect(milk!.path).toBe("Dairy & Eggs > Milk & Cream > Milk");
+    expect(milk!.department).toBe("Dairy & Eggs");
+    expect(milk!.aisle).toBe("Milk and Orange Juice");
+    expect(milk!.visible).toBe(true);
+    expect(milk!.hasProducts).toBe(true);
+    // Parents are sweep targets' ancestors, not sections of their own.
+    expect(leaves.map((l) => l.id)).not.toContain(10);
+    expect(leaves.map((l) => l.id)).not.toContain(11);
+  });
+  test("names with braces and quotes survive the parse", () => {
+    const butter = leaves.find((l) => l.id === 12);
+    expect(butter!.name).toBe('Butter {and} "Spreads"');
+    // Visible, but the branch stocks nothing in it: not work.
+    expect(butter!.hasProducts).toBe(false);
+  });
+  test("a department hidden at the parent hides its children", () => {
+    const matzah = leaves.find((l) => l.id === 21);
+    expect(matzah!.visible).toBe(false);
+    expect(matzah!.department).toBe("Passover");
+  });
+  test("a category under two parents is one section, not two", () => {
+    expect(leaves.filter((l) => l.id === 78154)).toHaveLength(1);
+  });
+});
+
+describe("storAiCategoryIdFromTerm", () => {
+  test("reads the store's category id out of a section term", () => {
+    expect(storAiCategoryIdFromTerm("categories/78154/products")).toBe(78154);
+    expect(storAiCategoryIdFromTerm("/categories/78154/products")).toBe(78154);
+  });
+  test("anything else is not a category term", () => {
+    expect(storAiCategoryIdFromTerm("milk")).toBeNull();
+    expect(storAiCategoryIdFromTerm("categories/abc/products")).toBeNull();
+    expect(storAiCategoryIdFromTerm("Specials")).toBeNull();
+  });
+});
+
+describe("storAiCategoryProductsUrl", () => {
+  test("builds the store's own product-list URL for one category", () => {
+    const url = new URL(
+      storAiCategoryProductsUrl({
+        homepage: "https://store.example.com",
+        retailerId: 1138,
+        branchId: 967,
+        categoryId: 78154,
+        size: 1,
+      }),
+    );
+    expect(url.pathname).toBe("/v2/retailers/1138/branches/967/products");
+    expect(url.searchParams.get("size")).toBe("1");
+    expect(url.searchParams.get("from")).toBe("0");
+    const filters = JSON.parse(url.searchParams.get("filters") ?? "{}");
+    expect(filters.must.term["family.categoriesPaths.id"]).toEqual([78154]);
+  });
+  test("a homepage with a trailing slash doesn't double it", () => {
+    const url = storAiCategoryProductsUrl({
+      homepage: "https://store.example.com/",
+      retailerId: 1138,
+      branchId: 967,
+      categoryId: 1,
+    });
+    expect(url).toContain("https://store.example.com/v2/retailers/1138/");
+  });
+});
+
+describe("jsonPageProblem", () => {
+  test("pages that match the store's own total are accepted", () => {
+    expect(
+      jsonPageProblem(39, [
+        { from: 0, size: 20, count: 20 },
+        { from: 20, size: 20, count: 19 },
+      ]),
+    ).toBeNull();
+  });
+  test("a page short of the total it should hold is rejected", () => {
+    expect(jsonPageProblem(39, [{ from: 0, size: 20, count: 17 }])).toContain(
+      "should hold 20",
+    );
+  });
+  test("a page claiming more products than it asked for is rejected", () => {
+    expect(jsonPageProblem(null, [{ from: 0, size: 20, count: 21 }])).toContain(
+      "asked for 20",
+    );
+  });
+  test("no pages reported means nothing to check (the tile read)", () => {
+    expect(jsonPageProblem(39, undefined)).toBeNull();
+    expect(jsonPageProblem(39, [])).toBeNull();
   });
 });

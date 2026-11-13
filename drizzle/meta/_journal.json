@@ -99,6 +99,20 @@
       "when": 1794524123139,
       "tag": "0014_add_price_history",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1794618000000,
+      "tag": "0015_section_batch_heartbeat",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1794618060000,
+      "tag": "0016_section_category_tree",
+      "breakpoints": true
     }
   ]
 }

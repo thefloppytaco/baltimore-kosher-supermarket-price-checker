@@ -1339,6 +1339,30 @@ export function App() {
                     {catalog.seven.newThisWeek > 0 && (
                       <> · {fmtCount(catalog.seven.newThisWeek)} new this week</>
                     )}
+                    {/* What the sweep is doing right now: several agents
+                        work different parts of the store at once, each
+                        holding a batch of sections, and a batch is only
+                        presumed dead after ten minutes with no save from
+                        any of its sections — so showing when the oldest
+                        one started is also what makes a wrongly reaped
+                        batch visible. */}
+                    {catalog.seven.sectionsRunning > 0 && (
+                      <span>
+                        {" "}
+                        · {catalog.seven.batchesRunning} agent
+                        {catalog.seven.batchesRunning === 1 ? "" : "s"} sweeping{" "}
+                        {catalog.seven.sectionsRunning} section
+                        {catalog.seven.sectionsRunning === 1 ? "" : "s"} now
+                        {catalog.seven.nowSweeping.length > 0
+                          ? ` (${catalog.seven.nowSweeping.slice(0, 4).join(", ")})`
+                          : ""}
+                        {catalog.seven.oldestBatchClaimedAt
+                          ? ` · oldest batch started ${fmtChecked(
+                              catalog.seven.oldestBatchClaimedAt,
+                            )}`
+                          : ""}
+                      </span>
+                    )}
                     {catalog.seven.sectionsErrored > 0 && (
                       <span className="text-[var(--lose)]">
                         {" "}

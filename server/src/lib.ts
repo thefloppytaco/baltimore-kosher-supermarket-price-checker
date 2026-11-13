@@ -986,3 +986,202 @@ export function listLineCost(
   }
   return roundMoney(product.price);
 }
+
+// ---------- stor.ai / Selfpoint catalog tree (data.js) ----------
+//
+// A stor.ai storefront ships its whole category tree in a public,
+// keyless Azure blob (`.../r-<retailerId>/desktop/multi-true/data.js`)
+// that the SERVER can fetch even though the storefront itself is
+// Cloudflare-walled. Everything below is pure parsing of that text:
+// the fetch lives in actions.ts, so these stay unit-testable.
+//
+// The file is a JavaScript assignment (`window.sp = { frontendData:
+// {...}, ... }`), not JSON, so the object is located by brace
+// matching rather than by a regex — a regex over a 1.3 MB bilingual
+// payload with braces inside strings is how a parser that "works"
+// silently truncates the tree.
+
+/** A leaf category of the store's own tree — one sweep target. */
+export interface StorAiLeaf {
+  /** Store's category id; the section term is `categories/<id>/products`. */
+  id: number;
+  /** English display name, whitespace-collapsed ("Milk"). */
+  name: string;
+  /** Breadcrumb from the department down ("Dairy & Eggs > Milk & Cream > Milk"). */
+  path: string;
+  /** Level-1 ancestor's name ("Dairy & Eggs"). */
+  department: string;
+  /** The store's physical aisle for the category, when it publishes one. */
+  aisle: string | null;
+  /** Visible to shoppers: this node and every ancestor, and at this branch. */
+  visible: boolean;
+  /** The branch stocks visible products in this category. */
+  hasProducts: boolean;
+}
+
+/**
+ * The `frontendData` object out of a stor.ai `data.js` blob, parsed.
+ * Throws when the marker or a balanced object can't be found — a
+ * caller must fall back to sitemap discovery rather than seed a
+ * partial tree.
+ */
+export function extractFrontendData(js: string): unknown {
+  const marker = js.indexOf("frontendData");
+  if (marker < 0) throw new Error("data.js has no frontendData object");
+  const start = js.indexOf("{", marker);
+  if (start < 0) throw new Error("data.js frontendData is not an object");
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < js.length; i++) {
+    const c = js[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) {
+      return JSON.parse(js.slice(start, i + 1));
+    }
+  }
+  throw new Error("data.js frontendData object is not balanced");
+}
+
+/** English name of a tree node, whitespace-collapsed. */
+function leafName(names: unknown): string {
+  const n = names as Record<string, unknown> | null | undefined;
+  const raw = typeof n?.["2"] === "string" ? n["2"] : n?.["1"];
+  return typeof raw === "string" ? raw.replace(/\s+/g, " ").trim() : "";
+}
+
+/**
+ * Every LEAF category in the parsed tree, flattened, with the
+ * breadcrumb and branch flags each one needs to become a sweep
+ * section. Children hang off `subCategories`; a node's `families`
+ * are product groups inside the category, not pages of their own, so
+ * a node with families but no subCategories is still a leaf.
+ *
+ * `visible` is the whole ancestor chain's own `isVisible` AND the
+ * branch's — the store hides entire seasonal departments by flipping
+ * the parent, which leaves the children's own flag true.
+ */
+export function storAiLeafCategories(
+  data: unknown,
+  branchId: number,
+): StorAiLeaf[] {
+  const root = data as { tree?: { categories?: unknown } } | null | undefined;
+  const top = root?.tree?.categories;
+  if (!Array.isArray(top)) return [];
+  const branchKey = String(branchId);
+  const leaves: StorAiLeaf[] = [];
+  const seen = new Set<number>();
+  const walk = (nodes: unknown[], trail: string[], ancestorsVisible: boolean) => {
+    for (const raw of nodes) {
+      const node = raw as Record<string, unknown>;
+      const id = typeof node.id === "number" ? node.id : Number(node.id);
+      const name = leafName(node.names);
+      const branch =
+        ((node.branches as Record<string, unknown> | undefined)?.[branchKey] as
+          | Record<string, unknown>
+          | undefined) ?? {};
+      const ownVisible = ancestorsVisible && node.isVisible === true;
+      const path = name ? [...trail, name] : trail;
+      const kids = Array.isArray(node.subCategories) ? node.subCategories : [];
+      if (kids.length === 0 && Number.isFinite(id) && name && !seen.has(id)) {
+        seen.add(id);
+        leaves.push({
+          id,
+          name,
+          path: path.join(" > "),
+          department: path[0] ?? name,
+          aisle:
+            typeof branch.aisleName === "string" && branch.aisleName.trim()
+              ? branch.aisleName.trim()
+              : null,
+          visible: ownVisible && branch.isVisible === true,
+          hasProducts: branch.hasVisibleProducts === true,
+        });
+      }
+      if (kids.length > 0) walk(kids, path, ownVisible);
+    }
+  };
+  walk(top, [], true);
+  return leaves;
+}
+
+/**
+ * What is wrong with a set of json-read pages, in words, or null when
+ * they check out. Under the experimental category read the agent
+ * reports every page of the store's product payload it transcribed, and
+ * the payload states its own `total`: a page starting at `from` must
+ * therefore hold exactly `min(size, total - from)` products. This is
+ * the guard the read has to pass before it can be trusted on a store —
+ * a browser agent asked to copy 39 products got the first 3 right and
+ * drifted after that, and a count that disagrees with the store's own
+ * arithmetic is the one signal of drift the server can check by itself.
+ */
+export function jsonPageProblem(
+  total: number | null | undefined,
+  pages: { from: number; size: number; count: number }[] | undefined,
+): string | null {
+  if (!pages || pages.length === 0) return null;
+  for (const page of pages) {
+    if (page.count > page.size) {
+      return `A page of the store's product data was reported with ${page.count} products but was asked for ${page.size} — the read doesn't match the page, so this pass was not accepted.`;
+    }
+    if (total == null) continue;
+    const want = Math.max(0, Math.min(page.size, total - page.from));
+    if (page.count !== want) {
+      return `The store's product data lists ${total} products in this category, so the page starting at ${page.from} should hold ${want}; ${page.count} were reported. The read doesn't match the store's own count, so this pass was not accepted.`;
+    }
+  }
+  return null;
+}
+
+/** The store's category id out of a section term
+ *  ("categories/78154/products" → 78154); null for any other term. */
+export function storAiCategoryIdFromTerm(term: string): number | null {
+  const m = term.match(/^\/?categories\/(\d+)\/products\/?$/);
+  if (!m?.[1]) return null;
+  const id = Number(m[1]);
+  return Number.isFinite(id) ? id : null;
+}
+
+/**
+ * The storefront's own product-list URL for one leaf category — the
+ * same unauthenticated endpoint its Angular tiles read. Used two
+ * ways: `size: 1` just to read the exact `total` a tile page often
+ * doesn't print, and (under the `json` read mode) small pages the
+ * agent transcribes directly. Carries NO sale flag and no barcode, so
+ * it can never replace the specials pass.
+ */
+export function storAiCategoryProductsUrl(opts: {
+  homepage: string;
+  retailerId: number;
+  branchId: number;
+  categoryId: number;
+  from?: number;
+  size?: number;
+}): string {
+  const filters = {
+    must: {
+      exists: ["family.id", "family.categoriesPaths.id", "branch.regularPrice"],
+      term: {
+        "branch.isActive": true,
+        "branch.isVisible": true,
+        "family.categoriesPaths.id": [opts.categoryId],
+      },
+    },
+    mustNot: { term: { "branch.regularPrice": 0 } },
+  };
+  const base = opts.homepage.endsWith("/") ? opts.homepage : `${opts.homepage}/`;
+  const query = new URLSearchParams({
+    from: String(opts.from ?? 0),
+    size: String(opts.size ?? 20),
+    filters: JSON.stringify(filters),
+  });
+  return `${base}v2/retailers/${opts.retailerId}/branches/${opts.branchId}/products?${query}`;
+}

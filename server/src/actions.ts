@@ -25,10 +25,15 @@
 // products, so unseen rows simply stop being served once they age
 // past the serve window. The browser store's catalog is indexed by
 // background agents (spawnTask) sweeping a section queue
-// (catalog_sections): a section is complete only when the distinct
-// products linked to it reach the total the store itself reported
-// for that page, and coverage is measured in linked products, never
-// in rows one pass happened to insert.
+// (catalog_sections) seeded from the store's own catalog tree — one
+// section per leaf category, fetched keylessly from the storefront's
+// catalog blob (seedSevenSections), with sitemap discovery as the
+// fallback. Several batches run at once, each held by one agent, and
+// every save heartbeats its whole batch so a live agent's unfinished
+// sections are never handed to a second one. A section is complete
+// only when the distinct products linked to it reach the total the
+// store itself reported for that page, and coverage is measured in
+// linked products, never in rows one pass happened to insert.
 //
 // Accuracy is verified, not assumed: the spot check samples catalog
 // products across the API store, re-fetches each live, and records
@@ -52,8 +57,10 @@ import {
   contentWords,
   dealPerItem,
   DEFAULT_AISLE,
+  extractFrontendData,
   foldWord,
   isWeightPriced,
+  jsonPageProblem,
   listLineCost,
   normalizeName,
   pairMatchTwo,
@@ -67,10 +74,14 @@ import {
   roundMoney,
   scoreMatch,
   scoredEntries,
+  storAiCategoryIdFromTerm,
+  storAiCategoryProductsUrl,
+  storAiLeafCategories,
   verdictFor,
   withUnit,
   type DealInfo,
   type PairGroup,
+  type StorAiLeaf,
 } from "./lib";
 
 /** Zod enum over the configured store keys — every request/response
@@ -1135,7 +1146,57 @@ const STAPLE_TERMS = [
   "paper towels", "toilet paper", "dish soap", "laundry detergent",
 ];
 
-async function seedSevenSections(ctx: Ctx) {
+/**
+ * The browser store's own category tree, read straight from the
+ * storefront's public catalog blob. The storefront answers the server
+ * with 403 — it is bot-walled, which is why its catalog is swept by
+ * browser agents at all — but the blob its own JavaScript loads is a
+ * keyless file the server CAN fetch, so the work queue is seeded from
+ * the store's real leaf categories (with their departments, breadcrumbs
+ * and aisle names) instead of from an agent's transcription of a
+ * sitemap page.
+ *
+ * Returns null when the store publishes no such blob, or when the fetch
+ * or the parse fails: the caller then falls back to sitemap discovery
+ * rather than seed a partial tree.
+ */
+async function fetchStoreCatalogTree(): Promise<StorAiLeaf[] | null> {
+  const url = BROWSER_STORE.catalogBlobUrl;
+  const branchId = BROWSER_STORE.branchId;
+  if (!url || branchId == null) return null;
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) return null;
+    const leaves = storAiLeafCategories(
+      extractFrontendData(await res.text()),
+      branchId,
+    );
+    return leaves.length > 0 ? leaves : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Make sure the browser store's work queue holds a section for every
+ * sweep target: one per leaf category of the store's own catalog tree,
+ * its specials page, and one per watchlist item.
+ *
+ * Category sections come from the catalog blob (fetchStoreCatalogTree),
+ * which also carries each leaf's department, breadcrumb, aisle name and
+ * visibility. Sitemap discovery is the fallback for when that blob
+ * can't be read, and the staple keyword searches are the fallback under
+ * that: both are seeded only while no category section exists at all.
+ * (The 54 staple searches had come to hold 25,037 section links for a
+ * 23,350-product store — a near-duplicate of the category walk, paid
+ * for in agent time.)
+ *
+ * The tree is re-read on the weekly sync (refreshTree) and whenever the
+ * queue has no category sections yet. Ordinary calls — page loads,
+ * watch refreshes — only top up the watch sections, so a board poll
+ * never pulls a megabyte-sized blob.
+ */
+async function seedSevenSections(ctx: Ctx, opts?: { refreshTree?: boolean }) {
   const db = ctx.db<typeof schema>();
   const existing = await db
     .select()
@@ -1143,19 +1204,101 @@ async function seedSevenSections(ctx: Ctx) {
     .where(eq(schema.catalogSections.store, BROWSER_STORE.key));
   const have = new Set(existing.map((s) => `${s.kind}:${s.term.toLowerCase()}`));
   const toAdd: (typeof schema.catalogSections.$inferInsert)[] = [];
-  // The discovery section reads the store's own sitemap page and seeds
-  // one "category" section per leaf category (via
-  // saveDiscoveredCategories), so the sweep walks the store's real
-  // category tree instead of only keyword searches.
-  if (!have.has("discovery:sitemap")) {
+  const categories = existing.filter((s) => s.kind === "category");
+
+  const leaves =
+    opts?.refreshTree || categories.length === 0
+      ? await fetchStoreCatalogTree()
+      : null;
+  if (leaves) {
+    // Terms keep the normalised form the sweep already uses
+    // ("categories/<id>/products", no leading slash), so sections an
+    // earlier sitemap discovery created are recognised and filled in
+    // rather than duplicated.
+    const byTerm = new Map(categories.map((s) => [s.term.toLowerCase(), s]));
+    for (const leaf of leaves) {
+      const term = `categories/${leaf.id}/products`;
+      // A leaf is swept when the store shows it AND the branch has
+      // visible products in it; anything else is parked as hidden.
+      const hidden = !(leaf.visible && leaf.hasProducts);
+      const row = byTerm.get(term);
+      if (!row) {
+        toAdd.push({
+          store: BROWSER_STORE.key,
+          term,
+          kind: "category",
+          status: "pending",
+          label: leaf.name,
+          department: leaf.department,
+          path: leaf.path,
+          aisle: leaf.aisle,
+          hidden,
+        });
+        continue;
+      }
+      if (
+        row.hidden === hidden &&
+        row.label === leaf.name &&
+        row.department === leaf.department &&
+        row.path === leaf.path &&
+        row.aisle === leaf.aisle
+      ) {
+        continue;
+      }
+      // A leaf the store has un-hidden (a seasonal department coming
+      // back, or stock arriving in a category that was empty) becomes
+      // work again. One it has hidden is parked, never deleted: the id
+      // stays stable, its products keep their history, and it returns
+      // with the season.
+      const revived =
+        row.hidden && !hidden && (row.status === "done" || row.status === "error");
+      await db
+        .update(schema.catalogSections)
+        .set({
+          label: leaf.name,
+          department: leaf.department,
+          path: leaf.path,
+          aisle: leaf.aisle,
+          hidden,
+          ...(revived
+            ? { status: "pending" as const, attempts: 0, updatedAt: new Date() }
+            : {}),
+        })
+        .where(eq(schema.catalogSections.id, row.id));
+    }
+  }
+
+  // Whether the sweep has a real category walk to work through. With
+  // one, neither sitemap discovery nor the staple searches are seeded:
+  // they exist to find categories, and the categories are known.
+  const haveCategoryWalk = categories.length > 0 || leaves != null;
+  // A sitemap-discovery section left queued from before the catalog
+  // tree was readable is retired, not re-run: it would have an agent
+  // transcribe a worse copy of a tree the server already holds, and
+  // discovery runs alone, so it would stall the parallel sweep behind
+  // it. (A discovery agent already out is left to finish and save.)
+  if (haveCategoryWalk) {
+    for (const s of existing) {
+      if (s.kind !== "discovery" || s.status === "done" || s.status === "running") {
+        continue;
+      }
+      await db
+        .update(schema.catalogSections)
+        .set({ status: "done", lastError: null, updatedAt: new Date() })
+        .where(eq(schema.catalogSections.id, s.id));
+    }
+  }
+  if (!haveCategoryWalk && !have.has("discovery:sitemap")) {
     toAdd.push({ store: BROWSER_STORE.key, term: "Sitemap", kind: "discovery", status: "pending" });
   }
   if (!have.has("specials:specials")) {
     toAdd.push({ store: BROWSER_STORE.key, term: "Specials", kind: "specials", status: "pending" });
   }
-  for (const term of STAPLE_TERMS) {
-    if (!have.has(`search:${term}`)) {
-      toAdd.push({ store: BROWSER_STORE.key, term, kind: "search", status: "pending" });
+  if (!haveCategoryWalk) {
+    for (const term of STAPLE_TERMS) {
+      if (!have.has(`search:${term}`)) {
+        toAdd.push({ store: BROWSER_STORE.key, term, kind: "search", status: "pending" });
+      }
     }
   }
   const items = await db.select().from(schema.watchItems);
@@ -1164,7 +1307,10 @@ async function seedSevenSections(ctx: Ctx) {
       toAdd.push({ store: BROWSER_STORE.key, term: item.query, kind: "watch", status: "pending" });
     }
   }
-  if (toAdd.length > 0) await db.insert(schema.catalogSections).values(toAdd);
+  for (let i = 0; i < toAdd.length; i += 400) {
+    const chunk = toAdd.slice(i, i + 400);
+    if (chunk.length > 0) await db.insert(schema.catalogSections).values(chunk);
+  }
 }
 
 /** Make sure a watch query has a Seven Mile section queued; re-queue it if asked to. */
@@ -1193,10 +1339,15 @@ async function ensureWatchSection(ctx: Ctx, query: string, requeue: boolean) {
 }
 
 const KIND_RANK = { discovery: 0, watch: 1, specials: 2, category: 3, search: 4 } as const;
+type SectionKind = keyof typeof KIND_RANK;
 
-// A claimed section whose agent never saves is presumed dead after this
-// long. The agent saves each section as it finishes it, and every save
-// stamps updatedAt — so a live batch heartbeats well inside this window.
+// A claimed BATCH whose agent has saved nothing for this long is
+// presumed dead. Ten minutes is measured against the batch's last save
+// by ANY of its sections (see catalog_sections.batchId): a batch of 8
+// categories runs 15–25 minutes, so a per-row clock presumed the rows
+// an agent hadn't reached yet dead while it was still working on them,
+// and handed them to a second agent. Shortening this window — the
+// obvious-looking fix — makes that worse, not better.
 const SEVEN_STALE_RUNNING_MS = 10 * 60 * 1000;
 // A section gets this many dispatches; if every one times out or fails,
 // it lands in "error" (visible on the board, retried on the next sync or
@@ -1207,18 +1358,48 @@ const SEVEN_MAX_ATTEMPTS = 3;
 // (a stall — a pass that adds nothing — stops it sooner). After this
 // many total dispatches a still-short section is accepted as done with
 // the shortfall recorded, so one stubborn page can't loop forever.
-const SEVEN_MAX_PASSES = 6;
+// Three, not two: a timeout also spends an attempt, and a short section
+// that lost one dispatch to a timeout still deserves its one real
+// re-pass.
+const SEVEN_MAX_PASSES = 3;
+// A shortfall this small isn't worth another agent: a page that lists
+// 237 and yields 234 is a lazy-load edge, not a broken section. The
+// shortfall is still recorded and still counted on the board — the
+// tolerance stops the RE-DISPATCH, it never declares the section
+// complete when it isn't.
+const SEVEN_SHORTFALL_TOLERANCE_MIN = 2;
+const SEVEN_SHORTFALL_TOLERANCE_FRACTION = 0.03;
+// How many indexing batches may be in flight at once. The store is
+// swept by independent agents, each owning its own batch of sections,
+// so the whole catalog finishes in hours instead of days. The ceiling
+// is a politeness dial as much as a throughput one: if agents start
+// reporting Cloudflare challenges, lower it.
+const SEVEN_MAX_CONCURRENT_BATCHES = 3;
+// Products per page under the "json" category read (stores.ts
+// catalogRead) — the experimental path that transcribes the store's own
+// product payload instead of its tiles. Deliberately small: a browser
+// agent asked to copy a 39-product payload got the first 3 right and
+// drifted after that, so pages stay short enough to verify and the
+// server checks every page's count against the payload's own total.
+const SEVEN_JSON_PAGE_SIZE = 20;
 // Page loads may kick the sweep opportunistically, but at most this often.
 const SEVEN_KICK_COOLDOWN_MS = 60 * 1000;
 
 /**
- * Start the next Seven Mile indexing batch if none is running. Each save
- * (saveCatalogResults) calls this again, so batches chain until every
- * section is indexed. Dead batches are reaped here: a section claimed
- * SEVEN_STALE_RUNNING_MS ago with no save since is re-queued with the
- * timeout recorded, or moved to "error" once its attempts run out — a
- * stall can no longer wedge the sweep the way the first batch did when
- * its agent died without calling back.
+ * Keep Seven Mile indexing batches in flight, up to
+ * SEVEN_MAX_CONCURRENT_BATCHES of them. Each save (saveCatalogResults)
+ * calls this again, so batches chain until every section is indexed,
+ * and several agents sweep different parts of the store at once.
+ *
+ * Dead batches are reaped here, and staleness is judged per BATCH: a
+ * batch is presumed dead only once SEVEN_STALE_RUNNING_MS have passed
+ * with no save from ANY of its sections, after which its sections are
+ * re-queued with the timeout recorded, or moved to "error" once their
+ * attempts run out. A stalled agent can no longer wedge the sweep —
+ * and, just as important, a LIVE agent's not-yet-reached sections are
+ * no longer presumed dead and handed to a second agent, which the old
+ * per-row clock did routinely (a batch of 8 runs 15–25 minutes and
+ * each save stamped only the row it had just saved).
  */
 async function kickSevenCrawl(
   ctx: Ctx,
@@ -1233,10 +1414,26 @@ async function kickSevenCrawl(
   const now = Date.now();
   const nowDate = new Date(now);
 
+  // Last sign of life per batch, over the sections still out with it:
+  // every save heartbeats all of its batch's running rows, so the
+  // newest stamp among them is the last time the agent proved it was
+  // alive — including for the sections it hasn't reached yet. (Rows
+  // that have finished keep their batch id for the record, but a batch
+  // with nothing running has nothing to reap.)
+  const batchSeenAt = new Map<string, number>();
+  for (const s of sections) {
+    if (!s.batchId || s.status !== "running") continue;
+    const at = Math.max(s.updatedAt?.getTime() ?? 0, s.claimedAt?.getTime() ?? 0);
+    batchSeenAt.set(s.batchId, Math.max(batchSeenAt.get(s.batchId) ?? 0, at));
+  }
   for (const s of sections) {
     if (s.status !== "running") continue;
-    const claimedAt = s.updatedAt ? s.updatedAt.getTime() : 0;
-    if (now - claimedAt <= SEVEN_STALE_RUNNING_MS) continue;
+    // Rows claimed before the batch columns existed keep the old
+    // per-row clock; there is nothing else to judge them by.
+    const seenAt = s.batchId
+      ? (batchSeenAt.get(s.batchId) ?? 0)
+      : (s.updatedAt?.getTime() ?? 0);
+    if (now - seenAt <= SEVEN_STALE_RUNNING_MS) continue;
     const exhausted = s.attempts >= SEVEN_MAX_ATTEMPTS;
     await db
       .update(schema.catalogSections)
@@ -1245,12 +1442,13 @@ async function kickSevenCrawl(
         lastError: exhausted
           ? `Indexing timed out ${s.attempts} times without saving — will retry on the next sync or refresh.`
           : "Indexing timed out before any results were saved — re-queued.",
+        batchId: null,
+        claimedAt: null,
         updatedAt: nowDate,
       })
       .where(eq(schema.catalogSections.id, s.id));
     s.status = exhausted ? "error" : "pending";
   }
-  if (sections.some((s) => s.status === "running")) return false;
 
   // Opportunistic kicks (page loads) respect a cooldown so a burst of
   // board polls can't each reap-and-claim; deliberate kicks (sync,
@@ -1265,11 +1463,59 @@ async function kickSevenCrawl(
     }
   }
 
+  // What is already in flight, counted in distinct batches. This bound
+  // replaced the old "any section anywhere is running" guard, which
+  // serialised the whole store behind one agent at a time.
+  const live = sections.filter((s) => s.status === "running");
+  const liveBatches = new Set(live.map((s) => s.batchId ?? `row-${s.id}`));
+  // A discovery agent seeds the category sections everything else works
+  // through, so it runs alone.
+  if (live.some((s) => s.kind === "discovery")) return false;
+
+  let started = false;
+  while (liveBatches.size < SEVEN_MAX_CONCURRENT_BATCHES) {
+    const dispatched = await dispatchSevenBatch(ctx);
+    if (!dispatched) break;
+    started = true;
+    liveBatches.add(dispatched.batchId);
+    if (dispatched.kind === "discovery") break;
+  }
+  if (started) {
+    await setSyncRow(ctx, BROWSER_STORE.key, {
+      status: "running",
+      error: null,
+      lastKickAt: nowDate,
+    });
+  }
+  return started;
+}
+
+/**
+ * Claim the next batch of pending sections and hand it to a background
+ * browser agent; returns the batch's id and kind once an agent has
+ * actually started. Every section in the batch carries the batch id, so
+ * any one of its saves heartbeats all of them (see saveCatalogResults).
+ */
+async function dispatchSevenBatch(
+  ctx: Ctx,
+): Promise<{ batchId: string; kind: SectionKind } | null> {
+  const db = ctx.db<typeof schema>();
+  const sections = await db
+    .select()
+    .from(schema.catalogSections)
+    .where(eq(schema.catalogSections.store, BROWSER_STORE.key))
+    .orderBy(asc(schema.catalogSections.id));
+  const now = Date.now();
+  const nowDate = new Date(now);
+
+  // Hidden leaves (categories the store hides, or that hold no visible
+  // products at this branch) stay in the queue as rows but are never
+  // dispatched — there is nothing on their page to read.
   const pending = sections
-    .filter((s) => s.status === "pending")
+    .filter((s) => s.status === "pending" && !s.hidden)
     .sort((a, b) => KIND_RANK[a.kind] - KIND_RANK[b.kind] || a.id - b.id);
   const top = pending[0];
-  if (!top) return false;
+  if (!top) return null;
   // Discovery runs alone (its save seeds the category sections the rest
   // of the sweep then works through). Leaf-category sections are small
   // and bounded, so they batch wider; everything else keeps the narrow
@@ -1277,12 +1523,15 @@ async function kickSevenCrawl(
   const limit =
     top.kind === "discovery" ? 1 : top.kind === "category" ? 8 : 4;
   const candidates = pending.slice(0, limit);
-  if (candidates.length === 0) return false;
+  if (candidates.length === 0) return null;
 
   // Claim atomically: each conditional update lands only while the
   // section is still pending, so two kicks racing each other can never
   // both dispatch an agent for the same section — the loser claims
-  // nothing and spawns nothing.
+  // nothing and spawns nothing. The claim also stamps the batch the
+  // section belongs to and when it was handed out, which is what makes
+  // the batch heartbeat — and any false reap — measurable.
+  const batchId = `${now}-${top.id}`;
   const batch: typeof candidates = [];
   for (const s of candidates) {
     const claimed = await db
@@ -1290,6 +1539,8 @@ async function kickSevenCrawl(
       .set({
         status: "running",
         attempts: sql`${schema.catalogSections.attempts} + 1`,
+        batchId,
+        claimedAt: nowDate,
         updatedAt: nowDate,
       })
       .where(
@@ -1301,20 +1552,56 @@ async function kickSevenCrawl(
       .returning({ id: schema.catalogSections.id });
     if (claimed.length > 0) batch.push(s);
   }
-  if (batch.length === 0) return false;
+  if (batch.length === 0) return null;
 
-  await setSyncRow(ctx, BROWSER_STORE.key, {
-    status: "running",
-    error: null,
-    lastKickAt: nowDate,
-  });
   const isDiscovery = batch[0]?.kind === "discovery";
+  // The store's own product-list URL for a leaf category, when the
+  // store config identifies the platform. Two uses: reading the exact
+  // `total` a category page often doesn't print, and (under the "json"
+  // read mode) the small-page experiment of transcribing the payload
+  // itself. Null for stores/sections it doesn't apply to.
+  const categoryJsonUrl = (term: string, size: number): string | null => {
+    const categoryId = storAiCategoryIdFromTerm(term);
+    if (
+      BROWSER_STORE.platform !== "storai" ||
+      categoryId == null ||
+      BROWSER_STORE.retailerId == null ||
+      BROWSER_STORE.branchId == null
+    ) {
+      return null;
+    }
+    return storAiCategoryProductsUrl({
+      homepage: BROWSER_STORE.homepage,
+      retailerId: BROWSER_STORE.retailerId,
+      branchId: BROWSER_STORE.branchId,
+      categoryId,
+      from: 0,
+      size,
+    });
+  };
+  const jsonRead = BROWSER_STORE.catalogRead === "json";
   const lines = batch
     .map((s) => {
       if (s.kind === "specials")
-        return `- sectionId ${s.id}: SPECIALS — open the store's specials / weekly deals page (look for a "Specials", "Weekly Ad", or "Deals" link) and record every product on it.`;
-      if (s.kind === "category")
-        return `- sectionId ${s.id}: CATEGORY — open ${BROWSER_STORE.homepage}${s.term} and record every product listed on that category page.`;
+        return `- sectionId ${s.id}: SPECIALS — open ${BROWSER_STORE.homepage}specials (the store's weekly deals page). Its sidebar lists the sale categories with a count beside each one: open EVERY one of those categories, record every product in it, and report the SUM of those sidebar counts as expectedCount. Where a tile prints a struck-through or "Was $19.99" original price, record that original as regularPrice and the sale price as price.`;
+      if (s.kind === "category") {
+        const pageUrl = `${BROWSER_STORE.homepage}${s.term}`;
+        const jsonUrl = jsonRead
+          ? categoryJsonUrl(s.term, SEVEN_JSON_PAGE_SIZE)
+          : categoryJsonUrl(s.term, 1);
+        if (jsonRead && jsonUrl) {
+          // Experiment (catalogRead: "json"): read the store's own
+          // product payload instead of its tiles. Small pages only —
+          // a 39-product page did not survive cross-checking — and no
+          // sale flag or size-from-tile, so it never owns specials.
+          return `- sectionId ${s.id}: CATEGORY (JSON READ) — open ${jsonUrl} in the browser. The tab shows the store's raw product payload. Report its "total" as expectedCount. For each entry in "products" copy EXACTLY, with no reformatting: names["2"] as the name, "brand" as the brand line, "weight" plus the unitOfMeasure name as sizeText (e.g. "10 Oz"), and branch.regularPrice as price. Then read the next page by changing from=${SEVEN_JSON_PAGE_SIZE} (then from=${SEVEN_JSON_PAGE_SIZE * 2}, …) in the URL until "from" reaches the total, and report every page's products together. For each page you read, add an entry to "pages": { "from": <the from you used>, "size": ${SEVEN_JSON_PAGE_SIZE}, "count": <how many products that page listed> }. This payload carries NO sale flag and no original price: send "onSale": false and "regularPrice": null for every product from it.`;
+        }
+        return `- sectionId ${s.id}: CATEGORY — open ${pageUrl} and record every product listed on that category page.${
+          jsonUrl
+            ? ` If that page prints no product total anywhere (no "123 products" count and no subcategory counts that add up), open ${jsonUrl} in a tab: it answers with the store's raw product data, whose "total" is the exact number of products in this category — report that as expectedCount.`
+            : ""
+        }`;
+      }
       return `- sectionId ${s.id}: use the store search for "${s.term}" and record the results.`;
     })
     .join("\n");
@@ -1334,34 +1621,157 @@ ${lines}
 For each assignment, page or scroll through the results until the store shows no more products, and record EVERY product shown — there is NO per-assignment limit. (An earlier version of this sweep capped assignments at 40 products and silently truncated the index; that cap is the bug being fixed. Do not stop early, do not sample.) If the page displays a total for the assignment — a result count like "123 products" on a search or category page, or a set of facet/subcategory counts that add up to the total — report that number as "expectedCount" in your save; if the page shows no total, report null. For each product record, exactly as displayed: the full product name (including any size in the name), the listed price as a number, the size (see SIZES below — required), the category/department if the page shows one (otherwise null), and whether the product shows a sale / special badge or a strikethrough original price (onSale true/false). Products from the SPECIALS page are all onSale: true.
 SIZES — REQUIRED FOR EVERY PRODUCT: each product tile on this store shows a small grey line directly ABOVE the product name in the form "Brand | size" — for example "Paskesz | 10 Oz" above "Mini White Chips", or "Lieber's | 0.75 Oz" above "Barbecue Potato Chips". That size is NOT part of the product name, and an earlier version of this sweep recorded only the name, which is why most of the database has no sizes — do not repeat that. For EVERY product, copy the size part of that line (everything after the "|") exactly as shown into the product's "sizeText" field — e.g. "10 Oz", "0.75 Oz", "5.2 Oz", "18 Oz", "48 ct", "12×12 Oz". Keep the product "name" as the tile's name text only (do not fold the brand or size into it). If a tile genuinely shows no such line, use "sizeText": null — never guess a size, and never copy a size from a neighboring product. Tiles with the SAME name but different sizes are DIFFERENT products (the store sells e.g. a 1 Oz bag and a 2.75 Oz bag under one name) — record each tile separately with its own size and price; do not merge them. You do NOT need to open a product's detail view for its size: it repeats the same line and adds nothing.
 PER-POUND PRICES: meat, chicken, fish, and deli are often priced BY WEIGHT — the page shows the price with a unit, like "Sale price $7.99 / Lb" or "$7.99/Lb". When a price is shown per lb or per oz, copy the FULL displayed price text, including the "/ Lb", into the product's "priceText" field (e.g. "$7.99 / Lb"), and still record "price" as the dollar amount (7.99 — the price of ONE pound). A size in the name like "3 Lb" is just the pack size and does NOT by itself mean the price is per pound — only record priceText when the PRICE itself is displayed with "/ Lb" or "/ Oz" (or "per lb" / "per oz"). Products whose price has no per-weight unit get "priceText": null.
+ORIGINAL ("WAS") PRICES: when a tile shows BOTH a sale price and the price it was before — a struck-through price, or wording like "Was $19.99 / Lb" — record the sale price as "price" and that original as "regularPrice" (a number, e.g. 19.99). Never infer, calculate or remember an original price: a tile that shows only one price gets "regularPrice": null. This is what lets the catalog put a product back to its ordinary price when the sale ends instead of carrying the sale price forever.
 MULTI-BUY DEALS: if a product's price is a bundle deal — the page shows wording like "4 for $5.00", "2/$5", "Buy 1 Get 1 Free", or "BOGO 50% off" — copy that wording EXACTLY as shown into the product's "dealText" field, and still record "price" as the dollar amount displayed with the deal (for "4 for $5.00" that is 5.00, the bundle total; for a buy-get deal it is the single-item price shown). Do NOT do the division yourself — the server converts the deal into a per-item price. A product with no multi-buy wording gets "dealText": null. Do not put ordinary sale prices or strikethrough prices in dealText — only multi-buy wording.
 3. As soon as you finish EACH assignment, save it with its own call to the artifact action "saveCatalogResults" on the artifact with slug "${ctx.slug}", with arguments:
-{ "results": [ { "sectionId": <id>, "expectedCount": <number or null>, "products": [ { "name": "...", "price": 0.00, "sizeText": "10 Oz", "priceText": null, "onSale": false, "category": null, "dealText": null } ], "error": null } ] }
+{ "results": [ { "sectionId": <id>, "expectedCount": <number or null>, "products": [ { "name": "...", "price": 0.00, "sizeText": "10 Oz", "priceText": null, "onSale": false, "regularPrice": null, "category": null, "dealText": null } ], "error": null } ] }
 Send the entry for an assignment even if it found nothing ("products": []). If the store cannot be reached or an assignment fails, send "products": [] and a short "error" string for that assignment, then move on to the next one. Saving each assignment separately means finished work is never lost if a later assignment stalls. Never invent a price you did not see on the page.`;
+  let failure: string | null = null;
   try {
-    await ctx.agent.spawnTask(taskText, {
+    const sent = await ctx.agent.spawnTask(taskText, {
       expectsAction: isDiscovery ? "saveDiscoveredCategories" : "saveCatalogResults",
+      // Batches sweep different sections of the store side by side, so
+      // the automatic one-task-at-a-time guard has to be off; the
+      // batch's own section ids are the single-flight key instead, which
+      // still stops a re-kick from dispatching the same batch twice.
+      allowParallel: true,
+      dedupeKey: `seven-batch-${batch
+        .map((s) => s.id)
+        .sort((a, b) => a - b)
+        .join("-")}`,
     });
-    return true;
-  } catch {
-    // Task could not start; hand the sections back to the queue.
-    for (const s of batch) {
+    if (!sent.ok) failure = sent.error;
+  } catch (e) {
+    failure = e instanceof Error ? e.message : "agent could not be started";
+  }
+  if (!failure) return { batchId, kind: top.kind };
+  // Task could not start; hand the sections back to the queue.
+  for (const s of batch) {
+    await db
+      .update(schema.catalogSections)
+      .set({
+        status: "pending",
+        lastError: "Indexing agent could not be started — re-queued.",
+        batchId: null,
+        claimedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(schema.catalogSections.id, s.id),
+          eq(schema.catalogSections.status, "running"),
+        ),
+      );
+  }
+  return null;
+}
+
+/**
+ * End the sale on products the store's specials page has stopped
+ * listing — without ever guessing a price.
+ *
+ * A product whose regular price the store itself printed while it was
+ * on sale ("Was $19.99") goes straight back to that price, sale flag
+ * off, with the change appended to price history. A product with no
+ * known regular price is deliberately NOT touched: its stored price IS
+ * a sale price, so clearing the flag alone would dress a sale price up
+ * as the ordinary one. Its own category pages are re-queued ahead of
+ * the rolling re-check instead, and the row keeps its price and its
+ * "checked on" date until an agent has actually seen it again.
+ *
+ * Either way the product stops being linked to the specials section, so
+ * next week's pass is measured against this week's set of sales.
+ */
+async function expireSevenSpecials(
+  ctx: Ctx,
+  section: typeof schema.catalogSections.$inferSelect,
+  productIds: number[],
+): Promise<void> {
+  if (productIds.length === 0) return;
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.catalogProducts)
+    .where(
+      and(
+        eq(schema.catalogProducts.store, BROWSER_STORE.key),
+        inArray(schema.catalogProducts.id, productIds),
+      ),
+    );
+  const now = new Date();
+  const history: Parameters<typeof recordPriceHistory>[1] = [];
+  const needRecheck: number[] = [];
+  for (const row of rows) {
+    const regular = row.regularPrice;
+    if (regular != null && regular > 0) {
+      if (row.price !== regular || row.onSale) {
+        history.push({
+          productId: row.id,
+          store: BROWSER_STORE.key,
+          price: regular,
+          onSale: false,
+          dealText: null,
+          observedAt: now,
+        });
+      }
+      await db
+        .update(schema.catalogProducts)
+        .set({
+          price: regular,
+          onSale: false,
+          // The regular price is simply the price now; left in place it
+          // would read as "reduced from" on a product that isn't.
+          regularPrice: null,
+          dealText: null,
+          dealQty: null,
+          dealTotal: null,
+          // priceText stays: it is where a per-pound price's basis
+          // lives, and that hasn't changed with the sale ending.
+        })
+        .where(eq(schema.catalogProducts.id, row.id));
+    } else if (row.onSale) {
+      needRecheck.push(row.id);
+    }
+  }
+  await recordPriceHistory(ctx, history);
+  if (needRecheck.length > 0) {
+    const links = await db
+      .select({ sectionId: schema.catalogSectionProducts.sectionId })
+      .from(schema.catalogSectionProducts)
+      .where(inArray(schema.catalogSectionProducts.productId, needRecheck));
+    const sectionIds = [...new Set(links.map((l) => l.sectionId))].filter(
+      (id) => id !== section.id,
+    );
+    if (sectionIds.length > 0) {
       await db
         .update(schema.catalogSections)
         .set({
           status: "pending",
-          lastError: "Indexing agent could not be started — re-queued.",
-          updatedAt: new Date(),
+          attempts: 0,
+          batchId: null,
+          claimedAt: null,
+          lastError:
+            "Re-queued ahead of the rolling re-check: products from this section came off the specials page with no regular price to fall back to, so their prices need to be seen again.",
+          updatedAt: now,
         })
         .where(
           and(
-            eq(schema.catalogSections.id, s.id),
-            eq(schema.catalogSections.status, "running"),
+            inArray(schema.catalogSections.id, sectionIds),
+            eq(schema.catalogSections.kind, "category"),
+            eq(schema.catalogSections.status, "done"),
+            eq(schema.catalogSections.hidden, false),
           ),
         );
     }
-    return false;
   }
+  await db
+    .delete(schema.catalogSectionProducts)
+    .where(
+      and(
+        eq(schema.catalogSectionProducts.sectionId, section.id),
+        inArray(schema.catalogSectionProducts.productId, productIds),
+      ),
+    );
 }
 
 /** Serve Seven Mile for the given items from the catalog; queue indexing for the rest. */
@@ -1408,6 +1818,18 @@ const catalogStoreSchema = z.object({
   sectionsDone: z.number(),
   sectionsTotal: z.number(),
   sectionsErrored: z.number(),
+  // The sweep as it stands right now: how many sections are out with an
+  // agent, in how many independent batches, and when the oldest of
+  // those batches was claimed. A batch is presumed dead only after ten
+  // minutes with no save from ANY of its sections, so a claim age well
+  // past that — with the batch still running — is how a false reap
+  // would show itself.
+  sectionsRunning: z.number(),
+  batchesRunning: z.number(),
+  oldestBatchClaimedAt: z.string().nullable(),
+  // What those agents are sweeping, named the way the store names it:
+  // the department from its own catalog tree, else the section label.
+  nowSweeping: z.array(z.string()),
   // Finished sections that still hold fewer distinct products than the
   // total the store itself reported for them — surfaced on the board so
   // a short sweep never reads as a complete one.
@@ -1615,10 +2037,29 @@ async function loadBoard(ctx: Ctx) {
     .select()
     .from(schema.catalogSections)
     .where(eq(schema.catalogSections.store, BROWSER_STORE.key));
+  // Hidden leaves (categories the store hides, or that hold nothing at
+  // this branch) are parked rows, not work — they would otherwise make
+  // the sweep read as permanently unfinished.
+  const sevenWork = sevenSections.filter((s) => !s.hidden);
+  const sevenRunning = sevenWork.filter((s) => s.status === "running");
+  const oldestClaim = sevenRunning.reduce<number | null>((acc, s) => {
+    const at = s.claimedAt?.getTime() ?? null;
+    if (at == null) return acc;
+    return acc == null || at < acc ? at : acc;
+  }, null);
+  // Named the way the store names it: the department from its own
+  // catalog tree, else the section's own label, else the kind.
+  const nowSweeping = [
+    ...new Set(
+      sevenRunning.map(
+        (s) => s.department ?? s.label ?? (s.kind === "category" ? "catalog" : s.kind),
+      ),
+    ),
+  ];
   const summaryFor = async (store: Store) => {
     const sync = syncRows.find((r) => r.store === store);
     const errored =
-      store === BROWSER_STORE.key ? sevenSections.filter((s) => s.status === "error") : [];
+      store === BROWSER_STORE.key ? sevenWork.filter((s) => s.status === "error") : [];
     const latestError = [...sevenSections]
       .filter((s) => s.lastError)
       .sort(
@@ -1660,12 +2101,24 @@ async function loadBoard(ctx: Ctx) {
       status: (sync?.status ?? "none") as "ok" | "running" | "error" | "none",
       lastSyncAt: sync?.lastSyncAt ? sync.lastSyncAt.toISOString() : null,
       sectionsDone:
-        store === BROWSER_STORE.key ? sevenSections.filter((s) => s.status === "done").length : 0,
-      sectionsTotal: store === BROWSER_STORE.key ? sevenSections.length : 0,
+        store === BROWSER_STORE.key
+          ? sevenWork.filter((s) => s.status === "done").length
+          : 0,
+      sectionsTotal: store === BROWSER_STORE.key ? sevenWork.length : 0,
       sectionsErrored: errored.length,
+      sectionsRunning: store === BROWSER_STORE.key ? sevenRunning.length : 0,
+      batchesRunning:
+        store === BROWSER_STORE.key
+          ? new Set(sevenRunning.map((s) => s.batchId ?? `row-${s.id}`)).size
+          : 0,
+      oldestBatchClaimedAt:
+        store === BROWSER_STORE.key && oldestClaim != null
+          ? new Date(oldestClaim).toISOString()
+          : null,
+      nowSweeping: store === BROWSER_STORE.key ? nowSweeping : [],
       sectionsShort:
         store === BROWSER_STORE.key
-          ? sevenSections.filter(
+          ? sevenWork.filter(
               (s) =>
                 s.status === "done" &&
                 s.expectedCount != null &&
@@ -2555,7 +3008,7 @@ export const Actions = {
 
   kickSevenSweep: defineAction({
     description:
-      "Watchdog for the Seven Mile indexing sweep, run hourly on a schedule so recovery never depends on someone opening the page: reaps batches whose agent died without saving (re-queueing them, or marking them errored once their attempts run out) and kicks the next batch.",
+      "Watchdog for the Seven Mile indexing sweep, run hourly on a schedule so recovery never depends on someone opening the page: reaps batches whose agent died without saving (a batch counts as dead only when none of its sections has saved for ten minutes, so a live agent's unfinished sections are never taken off it), re-queueing them or marking them errored once their attempts run out, and tops the sweep back up to its limit of concurrent batches.",
     request: z.object({}),
     response: z.object({ ok: z.literal(true), started: z.boolean() }),
     async handler(ctx): Promise<{ ok: true; started: boolean }> {
@@ -2687,7 +3140,7 @@ export const Actions = {
 
   syncCatalog: defineAction({
     description:
-      "Builds/refreshes the product catalog on the standing cadence: Market Maven is re-crawled in full through its store API when its data is over ~6 days old (or forced) — that weekly pass refreshes sale flags and prices and picks up new products; Seven Mile's background indexing sweep continues where it left off, and once a sweep completes, each weekly cycle resets only the specials + sitemap-discovery sections plus a quarter of the remaining sections — sections whose products still lack a package size first, then the oldest — so Seven Mile prices roll through a full re-check about once a month while specials and new categories/products are caught weekly, and the pre-size-column catalog backfills its missing package sizes ahead of ordinary re-checks.",
+      "Builds/refreshes the product catalog on the standing cadence: Market Maven is re-crawled in full through its store API when its data is over ~6 days old (or forced) — that weekly pass refreshes sale flags and prices and picks up new products; Seven Mile's background indexing sweep continues where it left off, with the weekly pass re-reading the store's own catalog tree (new leaf categories become sections, ones the store has un-hidden become work again, ones it now hides are parked). Once a sweep completes, each weekly cycle resets the specials section plus a quarter of the category and watch sections — sections whose products still lack a package size first, then the oldest — so Seven Mile prices roll through a full re-check about once a month while specials and new categories/products are caught weekly, and the pre-size-column catalog backfills its missing package sizes ahead of ordinary re-checks. The staple keyword searches are not re-swept: the category walk reads the same products through the store's own structure.",
     request: z.object({ force: z.boolean().optional() }),
     response: z.object({
       mavenCount: z.number(),
@@ -2733,7 +3186,11 @@ export const Actions = {
       // new categories and the products in them), plus the oldest
       // quarter of the remaining sections, so the whole store is
       // re-checked about once a month instead of all at once.
-      await seedSevenSections(ctx);
+      // The weekly pass is where the store's catalog tree is re-read:
+      // new leaf categories arrive as pending sections, leaves the
+      // store has un-hidden become work again, and ones it now hides
+      // are parked.
+      await seedSevenSections(ctx, { refreshTree: true });
       const sections = await db
         .select()
         .from(schema.catalogSections)
@@ -2747,16 +3204,26 @@ export const Actions = {
           s.status = "pending";
         }
       }
+      // Hidden leaves are not work: they are parked rows, so they
+      // neither hold the sweep open nor take a turn in the re-check.
+      const workSections = sections.filter((s) => !s.hidden);
       const allDone =
-        sections.length > 0 && sections.every((s) => s.status === "done");
+        workSections.length > 0 && workSections.every((s) => s.status === "done");
       if (allDone) {
-        const lastDone = sections.reduce<number>(
+        const lastDone = workSections.reduce<number>(
           (acc, s) => Math.max(acc, s.updatedAt ? s.updatedAt.getTime() : 0),
           0,
         );
         if (force || now - lastDone > REBUILD_GATE_MS) {
-          const weeklyKinds = sections.filter(
-            (s) => s.kind === "specials" || s.kind === "discovery",
+          // Specials reset every week (that is the whole point of the
+          // weekly cadence). Sitemap discovery only resets while it is
+          // still the source of the category walk — once the store's own
+          // catalog tree seeds the sections, re-reading the sitemap page
+          // costs an agent and tells us nothing new.
+          const haveCategoryWalk = workSections.some((s) => s.kind === "category");
+          const weeklyKinds = workSections.filter(
+            (s) =>
+              s.kind === "specials" || (s.kind === "discovery" && !haveCategoryWalk),
           );
           // Sections whose linked products still have no known size
           // (no stored size_text and no digit in the name — a stored
@@ -2773,8 +3240,15 @@ export const Actions = {
               AND p.name NOT GLOB '*[0-9]*'
           `);
           const sizelessSections = new Set(sizelessRows.map((r) => r.section_id));
-          const rest = sections
-            .filter((s) => s.kind !== "specials" && s.kind !== "discovery")
+          // Only the category walk and the watchlist roll through the
+          // monthly re-check. The staple keyword searches are NOT
+          // re-queued any more: they were a net cast under the category
+          // walk before the walk existed, and re-sweeping them re-reads
+          // the same products through a worse view of the store. The
+          // rows stay as they are — done, harmless, still linked to
+          // what they found.
+          const rest = workSections
+            .filter((s) => s.kind === "category" || s.kind === "watch")
             .sort(
               (a, b) =>
                 Number(sizelessSections.has(b.id)) -
@@ -2800,7 +3274,7 @@ export const Actions = {
         .from(schema.catalogSections)
         .where(eq(schema.catalogSections.store, BROWSER_STORE.key));
       const pendingCount = after.filter(
-        (s) => s.status === "pending" || s.status === "running",
+        (s) => !s.hidden && (s.status === "pending" || s.status === "running"),
       ).length;
       ctx.invalidateQueries();
       return {
@@ -2827,7 +3301,7 @@ export const Actions = {
 
   saveCatalogResults: defineAction({
     description:
-      "Saves one batch of Seven Mile indexing results from the background browser agent, links the products to their section, checks the section's coverage against the total the store itself reported (re-queueing it for another pass while it is short and still gaining products), then chains the next indexing batch until the store sweep is complete. A product whose page showed multi-buy wording carries it as dealText (with price as the displayed dollar amount); the server parses the deal and stores the per-item price, never the bundle total. A product priced by weight carries the displayed price text as priceText (\"$7.99 / Lb\"), which is how the catalog knows its price is per pound. Each product's package size — the size half of the tile's \"Brand | size\" line above its name — arrives as sizeText and is stored in the catalog's size_text column (dedupe is name+size, since one name sells at several sizes); before this, sizeText was accepted and silently dropped, which is why most Seven Mile products had no size.",
+      "Saves one batch of Seven Mile indexing results from the background browser agent, links the products to their section, checks the section's coverage against the total the store itself reported (re-queueing it for another pass while it is short by more than a lazy-load margin and still gaining products), heartbeats every other section of the saving agent's batch so none of them is presumed dead while that agent is alive, then tops the sweep back up to its limit of concurrent batches until the store is fully indexed. A save for the specials section also ends the sales it no longer lists: a product the store printed a \"Was\" price for goes back to that price with the change recorded, and one with no known regular price is left alone while its own category pages are re-queued, so a sale price is never quietly relabelled as the ordinary price. A product whose page showed multi-buy wording carries it as dealText (with price as the displayed dollar amount); the server parses the deal and stores the per-item price, never the bundle total. A product priced by weight carries the displayed price text as priceText (\"$7.99 / Lb\"), which is how the catalog knows its price is per pound. Each product's package size — the size half of the tile's \"Brand | size\" line above its name — arrives as sizeText and is stored in the catalog's size_text column (dedupe is name+size, since one name sells at several sizes); before this, sizeText was accepted and silently dropped, which is why most Seven Mile products had no size.",
     request: z.object({
       results: z.array(
         z.object({
@@ -2844,6 +3318,13 @@ export const Actions = {
               // weight ("$7.99 / Lb"); null for ordinary prices.
               priceText: z.string().max(80).nullable().optional(),
               onSale: z.boolean().optional(),
+              // The price the page says this one was before the sale —
+              // a struck-through price or "Was $19.99" — when it prints
+              // one. This is what lets a sale be undone honestly: when
+              // the product drops off the specials page, the catalog
+              // can put the regular price back instead of carrying the
+              // sale price as if it were normal.
+              regularPrice: z.number().nullable().optional(),
               category: z.string().nullable().optional(),
               // Multi-buy wording exactly as displayed ("4 for
               // $5.00", "Buy 1 Get 1 Free"), with price holding the
@@ -2851,6 +3332,19 @@ export const Actions = {
               dealText: z.string().max(120).nullable().optional(),
             }),
           ),
+          // Only under the experimental "json" category read: one entry
+          // per page of the store's product payload the agent read, so
+          // the server can check each page against the payload's own
+          // total instead of trusting the transcription.
+          pages: z
+            .array(
+              z.object({
+                from: z.number(),
+                size: z.number(),
+                count: z.number(),
+              }),
+            )
+            .optional(),
           error: z.string().nullable().optional(),
         }),
       ),
@@ -2896,7 +3390,12 @@ export const Actions = {
               dealText: deal?.text ?? null,
               dealQty: deal?.qty ?? null,
               dealTotal: deal?.total ?? null,
-              regularPrice: null,
+              // Only ever the original price the page itself printed
+              // next to the sale price (agents are told never to infer
+              // one). Undefined — not null — when the agent sent
+              // nothing, so a re-pass that doesn't see the "Was" line
+              // can't erase one already recorded.
+              regularPrice: p.regularPrice ?? undefined,
             };
           }),
         );
@@ -2906,11 +3405,18 @@ export const Actions = {
         // in distinct linked products — a re-pass mostly re-saves
         // products the catalog already has, so counting inserts would
         // read ~0 and misjudge a healthy continuation as stalled.
-        const before = await db
-          .select({ n: sql<number>`count(*)` })
+        const priorLinks = await db
+          .select({ productId: schema.catalogSectionProducts.productId })
           .from(schema.catalogSectionProducts)
           .where(eq(schema.catalogSectionProducts.sectionId, r.sectionId));
-        const linkedBefore = before[0]?.n ?? 0;
+        const linkedBefore = priorLinks.length;
+        const seenNow = new Set(ids.values());
+        // Products this section used to produce and this pass did not
+        // see at all. On the specials page that is the sale ending; on
+        // a category page it is normal churn between passes.
+        const goneNow = priorLinks
+          .map((l) => l.productId)
+          .filter((id) => !seenNow.has(id));
         const linkRows = [...new Set(ids.values())].map((productId) => ({
           sectionId: r.sectionId,
           productId,
@@ -2928,25 +3434,50 @@ export const Actions = {
           .select({ n: sql<number>`count(*)` })
           .from(schema.catalogSectionProducts)
           .where(eq(schema.catalogSectionProducts.sectionId, r.sectionId));
-        const linked = after[0]?.n ?? 0;
-        const added = linked - linkedBefore;
+        const linkedAll = after[0]?.n ?? 0;
+        const added = linkedAll - linkedBefore;
         const expected = r.expectedCount ?? section.expectedCount ?? null;
+        const pageProblem = jsonPageProblem(expected, r.pages);
+        // The specials page is a weekly SET, not a growing one, so its
+        // coverage is what this pass actually saw: last week's leftover
+        // links must not let a half-read page pass as complete. Every
+        // other section accumulates across passes by design.
+        const linked =
+          section.kind === "specials" ? linkedAll - goneNow.length : linkedAll;
 
         let status: "done" | "pending" | "error";
         let lastError: string | null = null;
         if (r.error && r.products.length === 0) {
           status = "error";
           lastError = r.error;
+        } else if (pageProblem) {
+          // A page whose own count disagrees with the store's total was
+          // mis-transcribed: that is exactly the risk the json read has
+          // to prove it doesn't run, so the pass is rejected, not saved
+          // over. (The products themselves are already upserted with
+          // the prices the agent reported; the section stays unfinished
+          // so a later pass re-reads it.)
+          status = section.attempts < SEVEN_MAX_PASSES ? "pending" : "error";
+          lastError = pageProblem;
         } else if (expected != null && linked < expected) {
           // Short of the store's own total: keep going while passes
-          // still add products; stop on a stall or the dispatch cap,
-          // recording the shortfall either way — never silently "done".
-          if (added > 0 && section.attempts < SEVEN_MAX_PASSES) {
+          // still add products; stop on a stall, the dispatch cap, or a
+          // shortfall too small to be worth an agent — the shortfall is
+          // recorded either way, never silently "done".
+          const shortfall = expected - linked;
+          const tolerance = Math.max(
+            SEVEN_SHORTFALL_TOLERANCE_MIN,
+            Math.ceil(expected * SEVEN_SHORTFALL_TOLERANCE_FRACTION),
+          );
+          if (added > 0 && shortfall > tolerance && section.attempts < SEVEN_MAX_PASSES) {
             status = "pending";
             lastError = `Saved ${linked} of the ${expected} products the store lists for this section — re-queued for another pass.`;
           } else {
             status = "done";
-            lastError = `Saved ${linked} of the ${expected} products the store lists for this section; repeat passes stopped adding more, so the shortfall is recorded here and retried when the section's turn comes in the rolling monthly re-check.`;
+            lastError =
+              shortfall <= tolerance
+                ? `Saved ${linked} of the ${expected} products the store lists for this section — ${shortfall} short, within the lazy-load margin, so the shortfall is recorded here rather than chased with another pass.`
+                : `Saved ${linked} of the ${expected} products the store lists for this section; repeat passes stopped adding more, so the shortfall is recorded here and retried when the section's turn comes in the rolling monthly re-check.`;
           }
         } else {
           status = "done";
@@ -2954,16 +3485,47 @@ export const Actions = {
             lastError = `Saved ${linked} products; the store's page reported ${expected} — its count looks off, the saved products are what's on the page.`;
           }
         }
+
+        // The sale is over for products the specials page no longer
+        // lists. Handled honestly, per product (see expireSevenSpecials):
+        // put back a regular price the store itself printed, or re-queue
+        // the product's own category pages and leave the row alone until
+        // it has been seen again.
+        let productCount = linkedAll;
+        if (section.kind === "specials" && status === "done" && goneNow.length > 0) {
+          await expireSevenSpecials(ctx, section, goneNow);
+          const recount = await db
+            .select({ n: sql<number>`count(*)` })
+            .from(schema.catalogSectionProducts)
+            .where(eq(schema.catalogSectionProducts.sectionId, r.sectionId));
+          productCount = recount[0]?.n ?? productCount;
+        }
         await db
           .update(schema.catalogSections)
           .set({
             status,
-            productCount: linked,
+            productCount,
             expectedCount: expected,
             lastError,
             updatedAt: new Date(),
           })
           .where(eq(schema.catalogSections.id, r.sectionId));
+        // This save is the whole batch's proof of life: an agent works
+        // its sections one at a time over 15–25 minutes, so stamping
+        // only the row just saved left its siblings looking abandoned
+        // and got them handed to a second agent while this one was
+        // still working. See SEVEN_STALE_RUNNING_MS.
+        if (section.batchId) {
+          await db
+            .update(schema.catalogSections)
+            .set({ updatedAt: new Date() })
+            .where(
+              and(
+                eq(schema.catalogSections.batchId, section.batchId),
+                eq(schema.catalogSections.status, "running"),
+              ),
+            );
+        }
         saved++;
       }
       // Refresh the Seven Mile sync summary, fill any watch items that

@@ -77,29 +77,65 @@ settings, and the rest follows.
   misses and forced re-checks.
 - **Browser store** (agent sweep): the store is bot-walled for direct
   fetch, so background browser agents (`ctx.agent.spawnTask`) sweep a
-  section queue: one sitemap-discovery section seeds one section per
-  leaf category, plus specials, staple searches, and one watch
-  section per watchlist item. Agents save each section as they finish
-  it via `saveCatalogResults`/`saveDiscoveredCategories`, and every
-  save chains the next batch. Agents are always told the artifact's
-  slug from `ctx.slug`.
+  section queue. The queue is seeded from the store's OWN catalog
+  tree: the server fetches the storefront's public catalog blob
+  (`catalogBlobUrl` in the store config — keyless, and readable even
+  though the storefront itself answers 403) and creates one `category`
+  section per visible leaf category that has products, carrying the
+  leaf's department, breadcrumb and the store's aisle name. Plus
+  specials and one watch section per watchlist item. Sitemap
+  discovery is the fallback when the blob can't be read, and the
+  staple keyword searches are the fallback under that — both are
+  seeded only while no category section exists at all. Agents save
+  each section as they finish it via `saveCatalogResults`/
+  `saveDiscoveredCategories`, every save tops the sweep back up, and
+  up to `SEVEN_MAX_CONCURRENT_BATCHES` (3) agents sweep different
+  parts of the store at once (`allowParallel` + a `dedupeKey` of the
+  batch's section ids). Agents are always told the artifact's slug
+  from `ctx.slug`.
 - **Sweep completeness contract**: a section is complete only when
   the DISTINCT products linked to it (`catalog_section_products`)
   reach the total the store itself reported for that page
   (`expectedCount`). Short-but-still-gaining sections re-queue (max
-  passes); a stall finishes the section WITH the shortfall recorded
-  and surfaced — a short sweep never reads as a complete one. Stale
-  claims (>10 min without a save) are reaped; after 3 timed-out
+  3 passes); a stall, the cap, or a shortfall inside the lazy-load
+  margin (2 products or 3%, whichever is larger) finishes the section
+  WITH the shortfall recorded and surfaced — a short sweep never
+  reads as a complete one, and the margin only stops the re-dispatch.
+- **Batch heartbeat**: staleness is a property of the BATCH, not of
+  one row. An agent holds up to 8 sections and saves them one at a
+  time over 15–25 minutes, so every save stamps `updated_at` on every
+  still-running section sharing its `batch_id`, and a batch is
+  presumed dead only after 10 minutes with no save from ANY of its
+  sections. Without this the reaper handed a live agent's unreached
+  sections to a second agent as a matter of routine (that is what the
+  duplicate `attempts: 2` sections in the first full sweep were), and
+  parallel dispatch multiplies the race. `claimed_at` is kept and
+  shown on the board so a false reap stays visible. After 3 timed-out
   attempts a section lands in `error` and retries on the next sync.
   Removing a watchlist item also removes its watch section and its
   section-product links from the queue.
 - **Cadence**: specials re-check weekly at both stores (the API
-  crawl carries sale flags; the browser store resets its specials +
-  discovery sections weekly); ordinary prices roll through a monthly
-  re-check (the browser store resets the oldest quarter of its
-  remaining sections weekly, sections whose products still lack a
+  crawl carries sale flags; the browser store resets its specials
+  section weekly); ordinary prices roll through a monthly re-check
+  (the browser store resets the oldest quarter of its category and
+  watch sections weekly, sections whose products still lack a
   package size first — that's also the size backfill order); new
-  products/categories are picked up by the weekly passes.
+  products/categories are picked up by the weekly passes, which
+  re-read the catalog blob (new leaves become sections; leaves the
+  store un-hides become work again; leaves it hides are parked with
+  `hidden = 1`, never deleted, so their ids and history survive the
+  season). The staple keyword searches are NOT re-queued once the
+  category walk exists: 54 of them had come to hold 25,037 section
+  links for a 23,350-product store, re-reading the same products
+  through a worse view of it.
+- **Sale expiry (browser store)**: when a product drops off the
+  specials page, the catalog puts back the regular price the store
+  itself printed next to the sale price ("Was $19.99" →
+  `regular_price`), logging the change to `price_history`. With no
+  known regular price the row is left exactly as it is — the stored
+  price IS a sale price, and clearing the flag alone would relabel it
+  as ordinary — and the product's own category sections are re-queued
+  ahead of the rolling re-check instead.
 - **Serving**: board lookups read the catalog first (token match,
   relevance-scored — see below); snapshots re-pick headline products
   and verdicts at read time, so matching fixes apply to saved cards
@@ -234,13 +270,64 @@ settings, and the rest follows.
   connection). A real browser session is the only route — exactly
   what the spawned indexing agent provides. Search snippets cannot
   supply shelf prices.
-- Coverage map: the store's own sitemap page
-  `https://www.shopsevenmilemarket.com/sitemap` lists the full
-  category tree (~370 leaf links of the form
-  `/categories/<id>/products`, e.g. Milk =
-  `/categories/78154/products`). Search and category pages display
-  totals (result counts; facet counts that sum to the page total) —
-  those are the `expectedCount` targets coverage is checked against.
+- **Coverage map — the catalog blob (primary).** A stor.ai storefront
+  publishes its whole category tree in a keyless Azure blob the SERVER
+  can fetch even while the storefront answers 403:
+  `https://htmlcache.blob.core.windows.net/html-production-env/r-<retailerId>/desktop/multi-true/data.js`
+  (Seven Mile: `r-1138`; `Last-Modified` within the hour). It is served
+  **`Content-Encoding: gzip`** whether or not the client asks — 149 KB
+  on the wire, 1.3 MB of text — so a client that doesn't decode gets
+  binary, not JavaScript (`fetch`/`res.text()` and `curl --compressed`
+  both decode; plain `curl` does not).
+  It is JavaScript, not JSON (`window.sp.frontendData = {...}`), so
+  the object is located by brace matching from the `frontendData`
+  marker and then `JSON.parse`d — a regex over a bilingual megabyte
+  with braces inside names is how a parser that "works" silently
+  truncates the tree (`extractFrontendData`, pinned by unit tests).
+  `tree.categories` nests by `subCategories`; a node's `families` are
+  product groups inside it, not pages, so a node with families and no
+  subCategories is a leaf. Each node carries `names["2"]` (English),
+  `isVisible`, and `branches[<branchId>]` with `isVisible`,
+  `hasVisibleProducts` and `aisleName` (the store's physical aisle,
+  e.g. "Milk and Orange Juice"). Visibility is the whole ancestor
+  chain's — the store hides entire seasonal departments by flipping
+  the parent while the children still say visible. Seven Mile, parsed
+  2026-11-12: 34 top-level departments, 849 leaves, of which **374 are
+  visible with products** (the sweep targets) and 475 are parked as
+  hidden or empty; 132 carry an aisle name. Section terms stay in the
+  sweep's normalised form
+  `categories/<id>/products` (no leading slash), so sections an
+  earlier sitemap discovery created are updated in place, not
+  duplicated.
+- Fallback coverage map: the store's own sitemap page
+  `https://www.shopsevenmilemarket.com/sitemap` lists the same tree as
+  ~370 leaf links (`/categories/<id>/products`, e.g. Milk =
+  `/categories/78154/products`) and is read by a discovery agent when
+  the blob can't be fetched. Search and category pages display totals
+  (result counts; facet counts that sum to the page total) — those are
+  the `expectedCount` targets coverage is checked against.
+- **The storefront's own product JSON** (unauthenticated, same
+  origin, no `appId` and no custom header needed — verified in a
+  browser session 2026-11-12):
+  `GET /v2/retailers/<rid>/branches/<bid>/products?from=&size=&filters={...}`
+  with the category id in `filters.must.term["family.categoriesPaths.id"]`
+  (`storAiCategoryProductsUrl`). What it carries: the exact `total`
+  for the category, `names["2"]`, `brand`, structured `weight` +
+  `unitOfMeasure`, `isWeighable`, `branch.regularPrice`, category
+  paths. What it does NOT carry: any sale flag or original price, and
+  no barcode/UPC (absent across all 39 milk products) — so it can
+  never replace the specials page or feed barcode matching. The
+  `/specials` sibling endpoint answers `{"error":"Forbidden"}`
+  unauthenticated. Fidelity caveat: an agent asked to transcribe a
+  39-product page got the first 3 right and drifted after that, so the
+  `json` read mode (`catalogRead` in the store config, default
+  `tiles`) pages at 20 and the server rejects any page whose reported
+  count isn't `min(size, total - from)` (`jsonPageProblem`). Treat it
+  as a per-store experiment to be proven against the tile read, not as
+  the default. The one unconditional win is the `total`: when a
+  category page prints no count, the agent opens this URL with
+  `size=1` and reports `total` as `expectedCount` — on the first full
+  sweep 7 of the last 10 completed sections had no visible total.
 - **Tile anatomy**: every listing tile prints a small grey
   **"Brand | size" line directly ABOVE the product name** ("Paskesz |
   10 Oz" over "Mini White Chips"). The size is NOT in the name, and
@@ -255,12 +342,28 @@ settings, and the rest follows.
   their full displayed price text ("$7.99 / Lb") in `priceText`, with
   `price` as the per-pound amount; multi-buy wording copied verbatim
   into `dealText` with `price` as the displayed amount (the server
-  does the deal arithmetic); the page's displayed total as
-  `expectedCount`; NO per-assignment product cap; and a separate save
-  per assignment as soon as it finishes.
+  does the deal arithmetic); a struck-through or "Was $X" original
+  price recorded as `regularPrice` (never inferred, never calculated);
+  the page's displayed total as `expectedCount`; NO per-assignment
+  product cap; and a separate save per assignment as soon as it
+  finishes.
+- **Specials page**: `${homepage}specials` is the sale set of record.
+  Its sidebar lists the sale categories with counts, so the specials
+  prompt walks every one of them and reports the facet sum as
+  `expectedCount` — a single-page read of it stopped at 103 products
+  with no total, while the facet counts suggest ~153, the same
+  lazy-load shortfall the category sweep fights. Reported (browser
+  session, 2026-11-12) to print "Was $19.99 / Lb" originals on sale
+  tiles; the first facet-walking pass confirms that on its own and the
+  shortfall text records what it found.
 - Probing a candidate store: expect 403 on a plain fetch of the
-  homepage; confirm `/sitemap` renders in a browser task and exposes
-  `/categories/<id>/products` links.
+  homepage. Find the retailer id (`r-<rid>`) in a script tag of the
+  storefront's HTML shell — via a browser task, or a Wayback raw
+  snapshot — then fetch `data.js` from the blob path above on the
+  server and confirm `tree.categories` and
+  `retailer.branches[0].id`. Confirm in a browser task that
+  `/categories/<id>/products` renders tiles. Keep `/sitemap` as the
+  fallback check.
 
 ### Flyers
 
@@ -305,6 +408,26 @@ settings, and the rest follows.
   other people's Claudes with no tokens.
 - **Scraping the API store's HTML**: it's a JS SPA with an empty
   shell; its own JSON API returns structured prices in ~2s.
+- **An in-page `fetch()` wrapper** to pull the storefront's product
+  JSON: the browser tooling has no JavaScript evaluation, no console
+  and no DevTools. A plain tab read of the JSON URL is the only form
+  available, which is why the `json` read mode is small-page and
+  server-validated rather than a bulk API client.
+- **Shortening the stale window or widening batches** to make the
+  sweep faster: the window was never the bottleneck, and a shorter one
+  reaps live batches (an 8-section batch runs 15–25 minutes). The
+  batch heartbeat plus `SEVEN_MAX_CONCURRENT_BATCHES` is the dial.
+- **XML sitemaps for change detection** (`/sitemap-pages-N.xml`):
+  `lastmod` is bulk-stamped and consecutive pages return identical
+  payloads, so they say nothing about price changes. The catalog blob
+  is the better census.
+- **Vision OCR of the weekly flyer PDF**: vector-outlined text, ~90
+  items, and a strict subset of the specials page — all risk against
+  the honesty rules for nothing new. (The flyer's URL does live in the
+  catalog blob's `retailer.toolbar`, so a change in it is a keyless
+  hint that a new specials week has started; that the URL rotates
+  weekly is an inference from the host's unique file ids, not
+  something observed over two weeks.)
 - **Native BarcodeDetector** for scanning: unsupported on Safari;
   ZXing in the browser works everywhere, with photo upload and typed
   digits as fallbacks.
@@ -317,8 +440,8 @@ Ship source only: `client/src`, `server/src` (including
 and a SKILL.md for the rebuilding Muse (probe both stores per the
 adapter notes → fill `stores.ts` → create the space through the
 web-artifact builder → first open auto-builds the catalog: the API
-store in ~a minute, the browser store over days of chained sweeps —
-set that expectation). Exclude: `app.db*`, `audits/`, `.harness/`,
+store in ~a minute, the browser store in hours of parallel chained
+sweeps — set that expectation). Exclude: `app.db*`, `audits/`, `.harness/`,
 `.space-build*`, `client/dist*`, `server/dist`, `node_modules`,
 `bun.lock` (the SDK is a `file:` tarball whose path differs per
 machine).

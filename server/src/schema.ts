@@ -191,12 +191,14 @@ export const brandPreferences = sqliteTable("brand_preferences", {
 // Seven Mile indexing work queue: one row per store section / search term
 // the background browser agent still has to sweep. The agent works through
 // these in chained batches until none are left, so a full-store index
-// finishes in the background however long it takes. Kinds: "discovery"
-// (reads the store's own sitemap page and seeds one section per leaf
-// category it finds), "category" (one leaf category page; term is the
-// page path, e.g. "categories/78154/products"), "specials", "search"
-// (staple keyword searches — a cross-check net under the category walk),
-// and "watch" (one per watchlist item).
+// finishes in the background however long it takes. Kinds: "category"
+// (one leaf category page; term is the page path, e.g.
+// "categories/78154/products" — seeded from the store's own catalog tree),
+// "specials", "discovery" (fallback only: reads the store's sitemap page
+// and seeds one section per leaf category it finds, used when the catalog
+// tree can't be fetched), "search" (staple keyword searches — the original
+// cross-check net, no longer seeded or re-queued once category sections
+// exist), and "watch" (one per watchlist item).
 export const catalogSections = sqliteTable("catalog_sections", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   store: text("store", { enum: STORE_KEYS }).notNull(),
@@ -230,6 +232,33 @@ export const catalogSections = sqliteTable("catalog_sections", {
   attempts: integer("attempts").notNull().default(0),
   lastError: text("last_error"),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }),
+  // The dispatch batch this section was claimed into, and when it was
+  // claimed (migration 0015). Staleness is a property of the BATCH, not
+  // of one row: an agent is handed up to 8 sections and saves them one
+  // at a time over 15–25 minutes, but each save only stamps its own
+  // row's updated_at — so siblings still being worked looked untouched
+  // and the reaper handed them to a second agent while the first was
+  // alive. Every save now heartbeats (updated_at) every running row
+  // sharing its batch_id, and a batch is presumed dead only after
+  // SEVEN_STALE_RUNNING_MS with no save from ANY of its sections.
+  // claimed_at is kept separately so the board can show how long a
+  // batch has really been out and false reaps stay visible.
+  batchId: text("batch_id"),
+  claimedAt: integer("claimed_at", { mode: "timestamp_ms" }),
+  // Where this section sits in the store's own catalog tree, as read
+  // from the store's catalog blob (migration 0016): the level-1
+  // department, the full "L1 > L2 > Leaf" breadcrumb, and the store's
+  // physical aisle name for the category when it publishes one
+  // ("Milk and Orange Juice"). All null for sections seeded from the
+  // sitemap fallback or for non-category kinds.
+  department: text("department"),
+  path: text("path"),
+  aisle: text("aisle"),
+  // A leaf category the store currently hides, or that holds no
+  // visible products at this branch. Kept rather than deleted (the
+  // store un-hides seasonal departments and the id must stay stable),
+  // but excluded from dispatch and from the rolling re-check.
+  hidden: integer("hidden", { mode: "boolean" }).notNull().default(false),
 });
 
 // Which catalog products each Seven Mile section has produced. This is

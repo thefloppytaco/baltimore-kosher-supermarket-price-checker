@@ -16,12 +16,30 @@
 //    crawl and live per-query checks, and support accuracy spot checks.
 //  - "browser": the store sits behind a bot check (Seven Mile runs on
 //    stor.ai/Selfpoint behind Cloudflare), so its catalog is indexed
-//    by background browser agents sweeping section by section.
+//    by background browser agents sweeping section by section. What
+//    the agents sweep still comes from the store itself: a stor.ai
+//    storefront publishes its whole category tree in a keyless blob
+//    (`catalogBlobUrl`) the server can fetch directly, so the work
+//    queue is seeded from real leaf categories, with sitemap
+//    discovery kept only as the fallback when that fetch fails.
 
 export const STORE_KEYS = ["maven", "seven"] as const;
 export type StoreKey = (typeof STORE_KEYS)[number];
 
 export type StoreAccess = "api" | "browser";
+
+/** Which storefront platform a browser store runs on, when known —
+ *  the key that unlocks that platform's keyless catalog surfaces
+ *  (see the adapter notes in DESIGN.md). */
+export type StorePlatform = "mycloudgrocer" | "storai";
+
+/** How a browser store's category pages get read. "tiles" is the
+ *  shipped default: the agent reads the rendered listing tiles, which
+ *  is the only source that carries sale badges and sizes. "json" is
+ *  the stor.ai JSON-API experiment — exact names and prices in small
+ *  pages, but no sale flag and no barcode — and must prove it matches
+ *  the tile read on a store before being switched on for it. */
+export type CatalogRead = "tiles" | "json";
 
 export interface StoreConfig {
   /** Stable key stored in the database and used in verdicts. */
@@ -42,6 +60,22 @@ export interface StoreConfig {
   access: StoreAccess;
   /** Whether the Settings accuracy spot check applies (API stores). */
   spotCheck: boolean;
+  /** Storefront platform, when identified by the Step 1 probe. */
+  platform?: StorePlatform;
+  /** stor.ai retailer id (the `r-<id>` in its catalog blob path). */
+  retailerId?: number;
+  /** stor.ai branch id — the physical store whose stock/prices count. */
+  branchId?: number;
+  /**
+   * Public, keyless URL of the storefront's catalog-tree blob. The
+   * server CAN fetch this even when the storefront itself answers 403,
+   * so the sweep seeds one section per real leaf category instead of
+   * asking a browser agent to transcribe a sitemap page. Leave unset
+   * and the sweep falls back to sitemap discovery.
+   */
+  catalogBlobUrl?: string;
+  /** Category-page read mode; defaults to "tiles" when unset. */
+  catalogRead?: CatalogRead;
 }
 
 export const STORES: Record<StoreKey, StoreConfig> = {
@@ -66,6 +100,12 @@ export const STORES: Record<StoreKey, StoreConfig> = {
     flyerLabel: "Seven Mile’s specials page",
     access: "browser",
     spotCheck: false,
+    platform: "storai",
+    retailerId: 1138,
+    branchId: 967,
+    catalogBlobUrl:
+      "https://htmlcache.blob.core.windows.net/html-production-env/r-1138/desktop/multi-true/data.js",
+    catalogRead: "tiles",
   },
 };
 

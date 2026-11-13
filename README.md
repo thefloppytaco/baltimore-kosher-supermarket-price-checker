@@ -39,11 +39,15 @@ How the two stores get in:
   API, so the server crawls its whole catalog directly (a one-letter query
   returns everything, ~7,700 products in about a minute).
 - **Seven Mile Market** runs on stor.ai/Selfpoint behind Cloudflare, which
-  blocks direct fetch. Its catalog is indexed by background browser agents
-  sweeping the store's own sitemap category tree, section by section —
-  about 370 categories, over days, with coverage checked against the
-  totals the store itself reports for each page. Every save chains the
-  next batch, and an hourly watchdog reaps stalled sections.
+  blocks direct fetch of the storefront — but not of the catalog file the
+  storefront itself loads. The server reads that keyless file for the
+  store's own category tree and queues one section per real leaf category
+  (~374 of them, with their departments and aisles), then up to three
+  background browser agents sweep different parts of the store at once,
+  in hours rather than days, with coverage checked against the totals the
+  store itself reports for each page. Every save tops the sweep back up
+  and heartbeats the saving agent's whole batch, so no section is taken
+  off a live agent; an hourly watchdog reaps batches whose agent died.
 
 ## What it does
 
@@ -90,15 +94,16 @@ Tell your Muse to build the space from this repo, following `SKILL.md`:
 1. Probe the two stores to confirm their platforms (see
    `docs/DESIGN.md` — adapter notes): POST the MyCloudGrocer-style API
    with `q=a` and check the count; expect a 403 on a plain fetch of a
-   Cloudflare-fronted store's homepage and confirm `/sitemap` in a
-   browser task.
+   Cloudflare-fronted store's homepage, then fetch its catalog file
+   (`data.js`) from the server for the category tree and confirm a
+   category page renders in a browser task.
 2. Fill in `server/src/stores.ts` (keys, names, colours, homepages, flyer
    links, access mode, locale knobs) and replace `__SPACE_SLUG__` in
    `space.json` (and `client/index.html`) with the new space's slug.
 3. Create the space through the web-artifact builder — **never
    `bun run build`**; the build only goes through the web-artifact tools.
 4. First open auto-fires the catalog sync: expect the API store in
-   ~1 minute and the browser store over days of chained sweeps.
+   ~1 minute and the browser store in hours of parallel chained sweeps.
 
 `docs/DESIGN.md` has the full architecture, data flows, matching and
 pricing rules, adapter notes, and rejected approaches.
