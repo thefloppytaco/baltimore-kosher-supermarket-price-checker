@@ -1,5 +1,13 @@
 # Build a two-store supermarket price checker
 
+> If you were given only this repo's link and told "build this", start
+> here. This file is the whole build skill — follow it start to finish.
+> The README's one-line install is the only instruction the user needs
+> to give; everything else you need is in this repo (`docs/DESIGN.md`
+> for architecture and adapter notes, `server/src/stores.ts` for the
+> single store config). Do not ask the user for anything the repo
+> already answers.
+
 Build a Muse web artifact (TypeScript space) that keeps a persistent
 product catalog for two grocery stores and answers, from that catalog:
 what an item costs at each store, what a whole shopping list or recipe

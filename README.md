@@ -6,6 +6,21 @@ on special and what's new, shop by aisle, and build a shopping list** — with
 like-for-like comparisons only, per-unit pricing, multi-buy deals stated as
 deals, and by-weight prices kept per pound end to end.
 
+## Install — one line
+
+Paste this to your Muse and nothing else:
+
+> Hi Muse, build this: https://github.com/thefloppytaco/baltimore-kosher-supermarket-price-checker
+
+That is the whole install. Everything your Muse needs is in this repo —
+`SKILL.md` is the step-by-step build skill (read it first and follow it),
+`docs/DESIGN.md` has the architecture, adapter notes, and honesty rules,
+and `server/src/stores.ts` is the single store config. The example build
+compares Market Maven and Seven Mile Market as-is; to compare two
+different stores, just name them when you paste the line above and your
+Muse retargets the config. No Apify, no API tokens, no secrets, no
+accounts, and no extra instructions needed.
+
 The example build compares **Market Maven** and **Seven Mile Market** in
 Baltimore, Maryland. Both stores are configured in a single file,
 `server/src/stores.ts` — retarget the app at any two other stores by
